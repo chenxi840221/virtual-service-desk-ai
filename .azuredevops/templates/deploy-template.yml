@@ -1,0 +1,224 @@
+# Deployment Template for DXC Virtual Service Desk AI
+
+parameters:
+- name: environment
+  type: string
+  values: ['dev', 'staging', 'prod']
+- name: azureSubscription
+  type: string
+- name: resourceGroupName
+  type: string
+- name: deployInfrastructure
+  type: boolean
+  default: false
+- name: deployApplication
+  type: boolean
+  default: true
+- name: deployDatabricks
+  type: boolean
+  default: true
+
+steps:
+- task: DownloadBuildArtifacts@0
+  displayName: 'Download Build Artifacts'
+  inputs:
+    buildType: 'current'
+    downloadType: 'specific'
+    downloadPath: '$(System.ArtifactsDirectory)'
+
+- task: AzureCLI@2
+  displayName: 'Login to Azure'
+  inputs:
+    azureSubscription: '${{ parameters.azureSubscription }}'
+    scriptType: 'bash'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      echo "✅ Logged into Azure subscription: $(az account show --query name -o tsv)"
+      echo "🏗️ Target Resource Group: ${{ parameters.resourceGroupName }}"
+
+# Infrastructure Deployment (optional)
+- ${{ if eq(parameters.deployInfrastructure, true) }}:
+  - task: AzurePowerShell@5
+    displayName: 'Deploy Azure Infrastructure'
+    inputs:
+      azureSubscription: '${{ parameters.azureSubscription }}'
+      scriptType: 'filePath'
+      scriptPath: 'infrastructure/azure/setup-azure-environment.ps1'
+      scriptArguments: |
+        -SubscriptionId $(az account show --query id -o tsv) 
+        -ResourceGroupName ${{ parameters.resourceGroupName }}
+        -Environment ${{ parameters.environment }}
+        -Location "Australia East"
+      azurePowerShellVersion: 'latestVersion'
+      workingDirectory: '$(System.DefaultWorkingDirectory)'
+
+# Application Deployment
+- ${{ if eq(parameters.deployApplication, true) }}:
+  - task: AzureWebApp@1
+    displayName: 'Deploy API to Azure Web App'
+    inputs:
+      azureSubscription: '${{ parameters.azureSubscription }}'
+      appType: 'webAppLinux'
+      appName: 'dxc-servicedesk-ai-${{ parameters.environment }}-webapp'
+      package: '$(System.ArtifactsDirectory)/drop/api/*.zip'
+      runtimeStack: 'DOTNETCORE|8.0'
+      appSettings: |
+        -ASPNETCORE_ENVIRONMENT ${{ parameters.environment }}
+        -KeyVault__VaultName dxc-servicedesk-ai-${{ parameters.environment }}-kv
+
+  - task: AzureAppServiceSettings@1
+    displayName: 'Configure App Service Settings'
+    inputs:
+      azureSubscription: '${{ parameters.azureSubscription }}'
+      appName: 'dxc-servicedesk-ai-${{ parameters.environment }}-webapp'
+      resourceGroupName: '${{ parameters.resourceGroupName }}'
+      appSettings: |
+        [
+          {
+            "name": "ASPNETCORE_ENVIRONMENT",
+            "value": "${{ parameters.environment }}"
+          },
+          {
+            "name": "KeyVault__VaultName", 
+            "value": "dxc-servicedesk-ai-${{ parameters.environment }}-kv"
+          },
+          {
+            "name": "Databricks__Environment",
+            "value": "${{ parameters.environment }}"
+          },
+          {
+            "name": "ApplicationInsights__CloudRoleName",
+            "value": "dxc-servicedesk-api-${{ parameters.environment }}"
+          }
+        ]
+
+# Databricks Deployment
+- ${{ if eq(parameters.deployDatabricks, true) }}:
+  - script: |
+      curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+      echo "##vso[task.prependpath]$(Agent.HomeDirectory)/.databricks/bin"
+    displayName: 'Install Databricks CLI'
+
+  - task: AzureCLI@2
+    displayName: 'Get Databricks Token'
+    inputs:
+      azureSubscription: '${{ parameters.azureSubscription }}'
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      inlineScript: |
+        # Get Databricks workspace URL
+        WORKSPACE_URL=$(az databricks workspace show \
+          --name "dxc-servicedesk-ai-${{ parameters.environment }}-databricks" \
+          --resource-group "${{ parameters.resourceGroupName }}" \
+          --query workspaceUrl -o tsv)
+        
+        echo "##vso[task.setvariable variable=DATABRICKS_HOST]https://$WORKSPACE_URL"
+        echo "✅ Databricks workspace: https://$WORKSPACE_URL"
+
+  - script: |
+      # Authenticate using Azure CLI
+      databricks auth login --azure-cli --host $(DATABRICKS_HOST)
+      
+      # Deploy bundle
+      cd databricks
+      databricks bundle deploy -t ${{ parameters.environment }}
+      
+      echo "✅ Databricks assets deployed successfully"
+    displayName: 'Deploy Databricks Assets'
+    env:
+      DATABRICKS_HOST: $(DATABRICKS_HOST)
+
+  - script: |
+      # Create or update Unity Catalog tables
+      databricks sql-file --file-path sql/create_tables.sql \
+        --warehouse-id $(DATABRICKS_WAREHOUSE_ID) \
+        --variable environment=${{ parameters.environment }}
+      
+      echo "✅ Unity Catalog tables created/updated"
+    displayName: 'Update Unity Catalog Tables'
+    workingDirectory: 'databricks'
+    env:
+      DATABRICKS_HOST: $(DATABRICKS_HOST)
+      DATABRICKS_WAREHOUSE_ID: $(DATABRICKS_WAREHOUSE_ID)
+
+# Configuration Updates
+- task: AzureCLI@2
+  displayName: 'Update Application Configuration'
+  inputs:
+    azureSubscription: '${{ parameters.azureSubscription }}'
+    scriptType: 'bash'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      # Get Key Vault name
+      KEY_VAULT_NAME="dxc-servicedesk-ai-${{ parameters.environment }}-kv"
+      
+      # Update secrets in Key Vault
+      az keyvault secret set \
+        --vault-name $KEY_VAULT_NAME \
+        --name "Environment" \
+        --value "${{ parameters.environment }}"
+      
+      az keyvault secret set \
+        --vault-name $KEY_VAULT_NAME \
+        --name "Deployment-Timestamp" \
+        --value "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      
+      az keyvault secret set \
+        --vault-name $KEY_VAULT_NAME \
+        --name "Build-Number" \
+        --value "$(Build.BuildNumber)"
+      
+      echo "✅ Configuration updated in Key Vault"
+
+# Health Check
+- task: AzureCLI@2
+  displayName: 'Post-Deployment Health Check'
+  inputs:
+    azureSubscription: '${{ parameters.azureSubscription }}'
+    scriptType: 'bash'
+    scriptLocation: 'inlineScript'
+    inlineScript: |
+      # Get Web App URL
+      WEB_APP_URL=$(az webapp show \
+        --name "dxc-servicedesk-ai-${{ parameters.environment }}-webapp" \
+        --resource-group "${{ parameters.resourceGroupName }}" \
+        --query defaultHostName -o tsv)
+      
+      # Health check
+      echo "🔍 Performing health check on https://$WEB_APP_URL"
+      
+      HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://$WEB_APP_URL/health || echo "000")
+      
+      if [ "$HEALTH_STATUS" = "200" ]; then
+        echo "✅ Health check passed (HTTP $HEALTH_STATUS)"
+      else
+        echo "❌ Health check failed (HTTP $HEALTH_STATUS)"
+        exit 1
+      fi
+
+# Generate Deployment Report
+- script: |
+    cat > $(Build.ArtifactStagingDirectory)/deployment-report-${{ parameters.environment }}.json << EOF
+    {
+      "deployment_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+      "environment": "${{ parameters.environment }}",
+      "build_number": "$(Build.BuildNumber)",
+      "commit_id": "$(Build.SourceVersion)",
+      "branch": "$(Build.SourceBranchName)",
+      "resource_group": "${{ parameters.resourceGroupName }}",
+      "deployed_components": {
+        "infrastructure": ${{ parameters.deployInfrastructure }},
+        "application": ${{ parameters.deployApplication }},
+        "databricks": ${{ parameters.deployDatabricks }}
+      },
+      "status": "completed"
+    }
+    EOF
+    echo "📊 Deployment report generated"
+  displayName: 'Generate Deployment Report'
+
+- task: PublishBuildArtifacts@1
+  displayName: 'Publish Deployment Report'
+  inputs:
+    pathToPublish: '$(Build.ArtifactStagingDirectory)/deployment-report-${{ parameters.environment }}.json'
+    artifactName: 'deployment-reports'

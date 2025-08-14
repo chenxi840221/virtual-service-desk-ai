@@ -1,0 +1,138 @@
+# Databricks Asset Validation Template
+
+parameters:
+- name: databricksHost
+  type: string
+  default: ''
+- name: environment
+  type: string
+  default: 'dev'
+
+steps:
+- task: UsePythonVersion@0
+  displayName: 'Use Python 3.11'
+  inputs:
+    versionSpec: '3.11'
+    addToPath: true
+
+- script: |
+    curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+    echo "##vso[task.prependpath]$(Agent.HomeDirectory)/.databricks/bin"
+  displayName: 'Install Databricks CLI'
+
+- script: |
+    pip install --upgrade pip
+    pip install databricks-cli==0.18.0
+    pip install requests
+  displayName: 'Install Python Dependencies'
+
+- script: |
+    # Validate notebook syntax
+    python -m py_compile databricks/notebooks/ticket_analysis.py
+    echo "✅ Notebook syntax validation passed"
+  displayName: 'Validate Notebook Syntax'
+
+- script: |
+    # Validate databricks.yml bundle configuration
+    if [ -f "databricks/databricks.yml" ]; then
+      databricks bundle validate -t ${{ parameters.environment }} --var catalog_name=test_catalog
+      echo "✅ Databricks bundle validation passed"
+    else
+      echo "❌ databricks.yml not found"
+      exit 1
+    fi
+  displayName: 'Validate Databricks Bundle'
+  env:
+    DATABRICKS_HOST: ${{ parameters.databricksHost }}
+    DATABRICKS_TOKEN: $(DATABRICKS_TOKEN)
+
+- script: |
+    # Validate SQL syntax in create_tables.sql
+    python -c "
+    import re
+    import sys
+    
+    def validate_sql_syntax(file_path):
+        with open(file_path, 'r') as f:
+            content = f.read()
+        
+        # Basic SQL syntax validation
+        required_keywords = ['CREATE TABLE', 'USING DELTA', 'COMMENT']
+        missing_keywords = []
+        
+        for keyword in required_keywords:
+            if keyword not in content.upper():
+                missing_keywords.append(keyword)
+        
+        if missing_keywords:
+            print(f'❌ Missing required SQL keywords: {missing_keywords}')
+            return False
+        
+        # Check for potential SQL injection patterns
+        dangerous_patterns = [';--', 'DROP TABLE', 'DELETE FROM', 'TRUNCATE']
+        for pattern in dangerous_patterns:
+            if pattern.upper() in content.upper():
+                print(f'⚠️ Warning: Found potentially dangerous pattern: {pattern}')
+        
+        print('✅ SQL syntax validation passed')
+        return True
+    
+    if not validate_sql_syntax('databricks/sql/create_tables.sql'):
+        sys.exit(1)
+    "
+  displayName: 'Validate SQL Scripts'
+
+- script: |
+    # Check for required environment variables and configurations
+    python -c "
+    import json
+    import os
+    
+    # Validate bundle configuration
+    with open('databricks/databricks.yml', 'r') as f:
+        content = f.read()
+        
+    required_sections = ['bundle:', 'variables:', 'targets:']
+    for section in required_sections:
+        if section not in content:
+            print(f'❌ Missing required section: {section}')
+            exit(1)
+    
+    print('✅ Configuration validation passed')
+    "
+  displayName: 'Validate Configuration'
+
+- script: |
+    # Generate validation report
+    cat > $(Build.ArtifactStagingDirectory)/databricks-validation-report.json << EOF
+    {
+      "validation_timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+      "environment": "${{ parameters.environment }}",
+      "status": "passed",
+      "validations": [
+        {
+          "type": "notebook_syntax",
+          "status": "passed",
+          "files_checked": ["databricks/notebooks/ticket_analysis.py"]
+        },
+        {
+          "type": "bundle_configuration", 
+          "status": "passed",
+          "files_checked": ["databricks/databricks.yml"]
+        },
+        {
+          "type": "sql_syntax",
+          "status": "passed", 
+          "files_checked": ["databricks/sql/create_tables.sql"]
+        }
+      ]
+    }
+    EOF
+    echo "📊 Validation report generated"
+  displayName: 'Generate Validation Report'
+
+- task: PublishBuildArtifacts@1
+  displayName: 'Publish Databricks Validation Report'
+  inputs:
+    pathToPublish: '$(Build.ArtifactStagingDirectory)/databricks-validation-report.json'
+    artifactName: 'databricks-validation'

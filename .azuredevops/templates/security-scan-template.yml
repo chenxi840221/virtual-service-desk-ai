@@ -1,0 +1,203 @@
+# Security Scanning Template for DXC Virtual Service Desk AI
+
+steps:
+- task: UseDotNet@2
+  displayName: 'Use .NET 8.0'
+  inputs:
+    packageType: 'sdk'
+    version: '8.0.x'
+
+# Dependency vulnerability scanning
+- script: |
+    # Install dotnet-audit tool
+    dotnet tool install --global dotnet-audit
+    
+    # Run vulnerability scan
+    dotnet audit --output-format json --output-file $(Build.ArtifactStagingDirectory)/vulnerability-scan.json
+    
+    # Check for critical vulnerabilities
+    CRITICAL_COUNT=$(cat $(Build.ArtifactStagingDirectory)/vulnerability-scan.json | jq '.vulnerabilities[] | select(.severity == "Critical") | length' | wc -l)
+    
+    if [ "$CRITICAL_COUNT" -gt 0 ]; then
+      echo "❌ Found $CRITICAL_COUNT critical vulnerabilities"
+      echo "##vso[task.logissue type=error]Critical vulnerabilities found in dependencies"
+      exit 1
+    else
+      echo "✅ No critical vulnerabilities found"
+    fi
+  displayName: 'Dependency Vulnerability Scan'
+  continueOnError: false
+
+# Code security analysis
+- script: |
+    # Install security code scanner
+    dotnet tool install --global security-scan --version 5.6.7
+    
+    # Run security analysis
+    security-scan --verbose --project VirtualServiceDesk.sln --export $(Build.ArtifactStagingDirectory)/security-analysis.sarif
+    
+    echo "✅ Security code analysis completed"
+  displayName: 'Security Code Analysis'
+  continueOnError: true
+
+# Docker image scanning (if using containers)
+- script: |
+    # Install Trivy for container scanning
+    sudo apt-get update
+    sudo apt-get install wget apt-transport-https gnupg lsb-release
+    wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+    echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+    sudo apt-get update
+    sudo apt-get install trivy
+    
+    # Scan for vulnerabilities in base images (example)
+    trivy image --format json --output $(Build.ArtifactStagingDirectory)/trivy-scan.json mcr.microsoft.com/dotnet/aspnet:8.0
+    
+    echo "✅ Container security scan completed"
+  displayName: 'Container Security Scan'
+  continueOnError: true
+
+# Secrets detection
+- script: |
+    # Install truffleHog for secrets detection
+    pip3 install truffleHog3
+    
+    # Scan for secrets in codebase
+    trufflehog3 --format json --output $(Build.ArtifactStagingDirectory)/secrets-scan.json $(Build.SourcesDirectory)
+    
+    # Check if any secrets were found
+    SECRETS_COUNT=$(cat $(Build.ArtifactStagingDirectory)/secrets-scan.json | jq '. | length')
+    
+    if [ "$SECRETS_COUNT" -gt 0 ]; then
+      echo "⚠️ Found $SECRETS_COUNT potential secrets"
+      echo "##vso[task.logissue type=warning]Potential secrets detected in codebase"
+    else
+      echo "✅ No secrets detected"
+    fi
+  displayName: 'Secrets Detection Scan'
+  continueOnError: true
+
+# Infrastructure security validation
+- script: |
+    # Install Checkov for Infrastructure as Code security
+    pip3 install checkov
+    
+    # Scan infrastructure scripts
+    checkov --framework arm --directory infrastructure/ --output json --output-file $(Build.ArtifactStagingDirectory)/infrastructure-security.json
+    
+    echo "✅ Infrastructure security scan completed"
+  displayName: 'Infrastructure Security Validation'
+  continueOnError: true
+
+# Generate security report
+- script: |
+    python3 -c "
+    import json
+    import os
+    from datetime import datetime
+    
+    # Aggregate security scan results
+    security_report = {
+        'scan_timestamp': datetime.utcnow().isoformat() + 'Z',
+        'build_number': os.environ.get('BUILD_BUILDNUMBER', 'unknown'),
+        'commit_id': os.environ.get('BUILD_SOURCEVERSION', 'unknown'),
+        'scans': {}
+    }
+    
+    # Process vulnerability scan
+    try:
+        with open('$(Build.ArtifactStagingDirectory)/vulnerability-scan.json', 'r') as f:
+            vuln_data = json.load(f)
+            security_report['scans']['vulnerability_scan'] = {
+                'status': 'completed',
+                'vulnerabilities_found': len(vuln_data.get('vulnerabilities', [])),
+                'critical_count': len([v for v in vuln_data.get('vulnerabilities', []) if v.get('severity') == 'Critical'])
+            }
+    except:
+        security_report['scans']['vulnerability_scan'] = {'status': 'failed'}
+    
+    # Process secrets scan
+    try:
+        with open('$(Build.ArtifactStagingDirectory)/secrets-scan.json', 'r') as f:
+            secrets_data = json.load(f)
+            security_report['scans']['secrets_scan'] = {
+                'status': 'completed',
+                'potential_secrets_found': len(secrets_data)
+            }
+    except:
+        security_report['scans']['secrets_scan'] = {'status': 'failed'}
+    
+    # Generate compliance score
+    total_critical = security_report['scans'].get('vulnerability_scan', {}).get('critical_count', 0)
+    secrets_found = security_report['scans'].get('secrets_scan', {}).get('potential_secrets_found', 0)
+    
+    if total_critical == 0 and secrets_found == 0:
+        compliance_score = 'A'
+    elif total_critical == 0 and secrets_found <= 2:
+        compliance_score = 'B'
+    elif total_critical <= 1:
+        compliance_score = 'C'
+    else:
+        compliance_score = 'F'
+    
+    security_report['compliance_score'] = compliance_score
+    security_report['recommendation'] = {
+        'A': 'Excellent security posture. Proceed with deployment.',
+        'B': 'Good security posture. Review potential secrets before deployment.',
+        'C': 'Acceptable security posture. Address critical vulnerabilities.',
+        'F': 'Poor security posture. Do not deploy until issues are resolved.'
+    }[compliance_score]
+    
+    with open('$(Build.ArtifactStagingDirectory)/security-report.json', 'w') as f:
+        json.dump(security_report, f, indent=2)
+    
+    print(f'✅ Security report generated with compliance score: {compliance_score}')
+    
+    # Fail build if compliance score is F
+    if compliance_score == 'F':
+        print('❌ Security compliance check failed')
+        exit(1)
+    "
+  displayName: 'Generate Security Report'
+
+# Publish security artifacts
+- task: PublishBuildArtifacts@1
+  displayName: 'Publish Security Scan Results'
+  condition: always()
+  inputs:
+    pathToPublish: '$(Build.ArtifactStagingDirectory)'
+    artifactName: 'security-reports'
+
+# Publish SARIF results for GitHub Advanced Security (if applicable)
+- task: PublishSecurityAnalysisLogs@3
+  displayName: 'Publish Security Analysis Logs'
+  condition: and(always(), exists('$(Build.ArtifactStagingDirectory)/security-analysis.sarif'))
+  inputs:
+    artifactName: 'CodeAnalysisLogs'
+    allTools: false
+    sarifLogFile: '$(Build.ArtifactStagingDirectory)/security-analysis.sarif'
+
+# Security gate check
+- script: |
+    # Read security report and determine if deployment should proceed
+    COMPLIANCE_SCORE=$(cat $(Build.ArtifactStagingDirectory)/security-report.json | jq -r '.compliance_score')
+    
+    case $COMPLIANCE_SCORE in
+      "A"|"B")
+        echo "✅ Security gate passed with score: $COMPLIANCE_SCORE"
+        ;;
+      "C")
+        echo "⚠️ Security gate passed with warnings: $COMPLIANCE_SCORE"
+        echo "##vso[task.logissue type=warning]Security issues detected but within acceptable limits"
+        ;;
+      "F")
+        echo "❌ Security gate failed: $COMPLIANCE_SCORE"
+        echo "##vso[task.logissue type=error]Critical security issues must be resolved before deployment"
+        exit 1
+        ;;
+      *)
+        echo "❓ Unknown compliance score: $COMPLIANCE_SCORE"
+        exit 1
+        ;;
+    esac
+  displayName: 'Security Gate Check'

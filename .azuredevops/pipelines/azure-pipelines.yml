@@ -1,0 +1,137 @@
+# Azure DevOps CI/CD Pipeline for DXC Virtual Service Desk AI
+# This pipeline builds, tests, and deploys the MVVM application and Databricks assets
+
+trigger:
+  branches:
+    include: [main, develop, feature/*]
+  paths:
+    include: 
+      - src/*
+      - databricks/*
+      - infrastructure/*
+    exclude:
+      - docs/*
+      - README.md
+
+variables:
+  buildConfiguration: 'Release'
+  dotNetFramework: 'net8.0'
+  dotNetVersion: '8.0.x'
+  vmImageName: 'ubuntu-latest'
+  
+# Build number format
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+pool:
+  vmImage: $(vmImageName)
+
+stages:
+- stage: Build
+  displayName: 'Build and Test'
+  jobs:
+  - job: BuildApplication
+    displayName: 'Build .NET Application'
+    steps:
+    - template: templates/dotnet-build-template.yml
+      parameters:
+        buildConfiguration: $(buildConfiguration)
+        dotNetVersion: $(dotNetVersion)
+        
+  - job: ValidateDatabricks
+    displayName: 'Validate Databricks Assets'
+    steps:
+    - template: templates/databricks-validate-template.yml
+
+  - job: SecurityScan
+    displayName: 'Security Scanning'
+    steps:
+    - template: templates/security-scan-template.yml
+
+- stage: DeployDev
+  displayName: 'Deploy to Development'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+  jobs:
+  - deployment: DeployToDevEnvironment
+    displayName: 'Deploy to Development Environment'
+    environment: 'dxc-servicedesk-dev'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - template: templates/deploy-template.yml
+            parameters:
+              environment: 'dev'
+              azureSubscription: 'DXC-ServiceDesk-Dev'
+              resourceGroupName: 'dxc-servicedesk-ai-dev-rg'
+
+- stage: DeployStaging
+  displayName: 'Deploy to Staging'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: DeployToStagingEnvironment
+    displayName: 'Deploy to Staging Environment'
+    environment: 'dxc-servicedesk-staging'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - template: templates/deploy-template.yml
+            parameters:
+              environment: 'staging'
+              azureSubscription: 'DXC-ServiceDesk-Staging'
+              resourceGroupName: 'dxc-servicedesk-ai-staging-rg'
+          - template: templates/integration-tests-template.yml
+            parameters:
+              environment: 'staging'
+
+- stage: DeployProduction
+  displayName: 'Deploy to Production'
+  dependsOn: 
+    - DeployStaging
+    - ApprovalGate
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: DeployToProductionEnvironment
+    displayName: 'Deploy to Production Environment'
+    environment: 'dxc-servicedesk-production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - template: templates/deploy-template.yml
+            parameters:
+              environment: 'prod'
+              azureSubscription: 'DXC-ServiceDesk-Production'
+              resourceGroupName: 'dxc-servicedesk-ai-prod-rg'
+          - template: templates/smoke-tests-template.yml
+            parameters:
+              environment: 'prod'
+
+- stage: ApprovalGate
+  displayName: 'Production Approval Gate'
+  dependsOn: DeployStaging
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: WaitForValidation
+    displayName: 'Wait for Manual Validation'
+    pool: server
+    timeoutInMinutes: 4320 # 3 days
+    steps:
+    - task: ManualValidation@0
+      displayName: 'Manual Validation for Production Deployment'
+      inputs:
+        notifyUsers: |
+          project-manager@dxc.com
+          technical-lead@dxc.com
+          business-analyst@dxc.com
+        instructions: |
+          Please review the staging deployment and validate:
+          1. All integration tests passed
+          2. Performance metrics meet SLA requirements
+          3. Security scan results are acceptable
+          4. Business stakeholder sign-off received
+          
+          Approve to proceed with production deployment.
+        onTimeout: 'reject'
