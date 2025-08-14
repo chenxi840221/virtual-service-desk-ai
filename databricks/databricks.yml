@@ -1,0 +1,36 @@
+bundle:
+  name: dxc-service-desk-ai
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Unity Catalog name
+    default: dxc_service_desk
+  
+  schema:
+    description: Schema name  
+    default: ai_models
+
+targets:
+  dev:
+    mode: development
+    workspace:
+      host: https://adb-${workspace_id}.${region}.azuredatabricks.net
+    variables:
+      catalog: dxc_service_desk_dev
+      
+  staging:
+    mode: development
+    workspace:
+      host: https://adb-${workspace_id}.${region}.azuredatabricks.net
+    variables:
+      catalog: dxc_service_desk_staging
+      
+  prod:
+    mode: production
+    workspace:
+      host: https://adb-${workspace_id}.${region}.azuredatabricks.net
+    variables:
+      catalog: dxc_service_desk_prod
